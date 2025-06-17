@@ -6,6 +6,10 @@ import concurrent.futures
 import time
 import queue
 import threading
+import zipfile
+import tempfile
+import io
+import base64
 
 # Initialize session state FIRST
 if 'download_results' not in st.session_state:
@@ -23,9 +27,12 @@ st.set_page_config(
 st.title("📺 YouTube Batch Downloader")
 st.markdown("Download multiple YouTube videos or extract audio with ease!")
 
-# Create download directory
-DOWNLOAD_DIR = Path("downloads")
+# Create download directory in a temporary location
+
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "youtube_downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+st.info(f"📁 Files are temporarily stored on server and will be available for download below")
 
 class DownloadProgress:
     def __init__(self):
@@ -80,11 +87,34 @@ def download_single_video(url, options, video_id, progress_tracker):
             # Download the video
             ydl.download([url])
             
+            # Verify file was actually downloaded
+            expected_filename = ydl.prepare_filename(info)
+            if os.path.exists(expected_filename):
+                file_size = os.path.getsize(expected_filename)
+                file_size_mb = file_size / (1024 * 1024)
+                success_msg = f'✅ Downloaded successfully ({file_size_mb:.1f} MB)'
+            else:
+                # Check if file exists with different extension (common with postprocessors)
+                base_name = os.path.splitext(expected_filename)[0]
+                found_files = []
+                for ext in ['.mp4', '.mp3', '.m4a', '.webm', '.mkv', '.wav', '.flac']:
+                    potential_file = base_name + ext
+                    if os.path.exists(potential_file):
+                        found_files.append(potential_file)
+                
+                if found_files:
+                    file_size = os.path.getsize(found_files[0])
+                    file_size_mb = file_size / (1024 * 1024)
+                    success_msg = f'✅ Downloaded successfully ({file_size_mb:.1f} MB)'
+                else:
+                    success_msg = '⚠️ Download completed but file not found'
+            
             return {
                 'url': url,
                 'title': title,
                 'status': 'success',
-                'message': '✅ Download completed successfully'
+                'message': success_msg,
+                'file_path': expected_filename
             }
             
     except Exception as e:
@@ -94,10 +124,39 @@ def download_single_video(url, options, video_id, progress_tracker):
             'url': url,
             'title': f'Video_{video_id}',
             'status': 'error',
-            'message': error_msg
+            'message': error_msg,
+            'file_path': None
         }
 
-def validate_youtube_url(url):
+def create_download_button(file_path, file_name):
+    """Create a download button for a file"""
+    if os.path.exists(file_path):
+        with open(file_path, 'rb') as f:
+            file_data = f.read()
+        
+        st.download_button(
+            label=f"⬇️ Download {file_name}",
+            data=file_data,
+            file_name=file_name,
+            mime="application/octet-stream"
+        )
+        return True
+    return False
+
+def create_zip_download(files_list):
+    """Create a zip file containing all downloaded files"""
+    if not files_list:
+        return None
+    
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for file_path in files_list:
+            if os.path.exists(file_path):
+                file_name = os.path.basename(file_path)
+                zip_file.write(file_path, file_name)
+    
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
     """Validate if URL is a valid YouTube URL"""
     youtube_domains = ['youtube.com', 'youtu.be', 'www.youtube.com', 'm.youtube.com']
     return any(domain in url.lower() for domain in youtube_domains)
@@ -234,6 +293,8 @@ if download_button:
             'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'),
             'no_warnings': False,
             'extract_flat': False,
+            'writeinfojson': False,  # Don't write info json
+            'writethumbnail': False,  # Don't write thumbnail
         }
         
         if download_type == "Audio Only":
@@ -297,8 +358,83 @@ if st.session_state.download_results and not st.session_state.is_downloading:
     
     if completed > 0:
         st.success(f"🎉 Batch download completed! {completed} successful, {failed} failed out of {len(results)} total")
+        
+        # Show file listing with download buttons
+        if DOWNLOAD_DIR.exists():
+            files = list(DOWNLOAD_DIR.glob('*'))
+            video_files = [f for f in files if f.is_file() and f.suffix.lower() in ['.mp4', '.mp3', '.m4a', '.webm', '.mkv', '.wav', '.flac']]
+            
+            if video_files:
+                st.subheader("📂 Your Downloaded Files")
+                
+                # Create zip download for all files
+                if len(video_files) > 1:
+                    zip_data = create_zip_download([str(f) for f in video_files])
+                    if zip_data:
+                        st.download_button(
+                            label="📦 Download All Files as ZIP",
+                            data=zip_data,
+                            file_name="youtube_downloads.zip",
+                            mime="application/zip"
+                        )
+                        st.divider()
+                
+                # Individual file downloads
+                for file in sorted(video_files, key=lambda x: x.stat().st_mtime, reverse=True):
+                    file_size = file.stat().st_size / (1024 * 1024)  # MB
+                    col1, col2 = st.columns([3, 1])
+                    
+                    with col1:
+                        st.text(f"📄 {file.name} ({file_size:.1f} MB)")
+                    
+                    with col2:
+                        create_download_button(str(file), file.name)
     else:
         st.error(f"❌ All downloads failed. {failed} out of {len(results)} total")
+
+# Add file browser section with download buttons
+st.subheader("📂 Available Downloads")
+if DOWNLOAD_DIR.exists():
+    files = list(DOWNLOAD_DIR.glob('*'))
+    video_files = [f for f in files if f.is_file() and f.suffix.lower() in ['.mp4', '.mp3', '.m4a', '.webm', '.mkv', '.wav', '.flac']]
+    
+    if video_files:
+        st.write(f"**Files ready for download:** ({len(video_files)} files)")
+        
+        # Bulk download option
+        if len(video_files) > 1:
+            zip_data = create_zip_download([str(f) for f in video_files])
+            if zip_data:
+                st.download_button(
+                    label="📦 Download All Files as ZIP",
+                    data=zip_data,
+                    file_name="youtube_downloads.zip",
+                    mime="application/zip",
+                    key="bulk_download"
+                )
+                st.divider()
+        
+        # Individual downloads
+        for file in sorted(video_files, key=lambda x: x.stat().st_mtime, reverse=True):
+            file_size = file.stat().st_size / (1024 * 1024)  # MB
+            modified_time = time.ctime(file.stat().st_mtime)
+            
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.text(f"📄 {file.name}")
+                st.caption(f"Size: {file_size:.1f} MB | Modified: {modified_time}")
+            
+            with col2:
+                create_download_button(str(file), file.name)
+    else:
+        st.info("No video/audio files available for download yet.")
+        
+        # Clean up any non-media files
+        other_files = [f for f in files if f.is_file()]
+        if other_files:
+            st.caption(f"Note: Found {len(other_files)} other files (info/thumbnails) - only media files are shown")
+else:
+    st.error("Download folder not accessible!")
 
 # Instructions
 st.subheader("📋 Instructions")
@@ -307,7 +443,8 @@ st.markdown("""
 2. **Configure Options**: Choose download type, quality, and format in the sidebar
 3. **Start Download**: Click the download button to begin batch processing
 4. **Monitor Progress**: Watch the download status in real-time on the right
-5. **Find Files**: Downloaded files will be saved in the `downloads` folder
+5. **Download Files**: Use the download buttons below to save files to your device
+6. **Bulk Download**: Use "Download All as ZIP" for multiple files at once
 
 **Supported URL formats:**
 - `https://www.youtube.com/watch?v=VIDEO_ID`
@@ -316,6 +453,11 @@ st.markdown("""
 """)
 
 # Requirements info
+st.subheader("🔧 Installation Requirements")
+st.code("""
+pip install streamlit yt-dlp
+""")
+
 st.markdown("**Note**: Make sure you have `ffmpeg` installed for audio extraction features.")
 
 # Footer
