@@ -32,7 +32,8 @@ def download_media(url, media_type='video'):
         if not video_id:
             raise ValueError("Invalid YouTube URL")
             
-        clean_url = f"https://www.youtube.com/watch?v={video_id}"
+        # FIX: Construct a standard YouTube URL for pytube
+        clean_url = f"https://www.youtube.com/watch?v={video_id}" 
         yt = YouTube(clean_url)
         
         if media_type == 'audio':
@@ -61,7 +62,7 @@ with st.expander("📥 Input URLs", expanded=True):
     urls = st.text_area(
         "Enter YouTube URLs (one per line):", 
         height=150,
-        placeholder="https://www.youtube.com/watch?v=...\nhttps://youtu.be/..."
+        placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ\nhttps://youtu.be/another_video_id" # Updated placeholder
     )
     
     col1, col2 = st.columns(2)
@@ -114,7 +115,7 @@ if st.button("🚀 Download Media", use_container_width=True):
             downloaded_items.append(title)
             
         except Exception as e:
-            st.error(f"❌ Failed to download: {str(e)}")
+            st.error(f"❌ Failed to download '{url}': {str(e)}") # Added original URL to error message
     
     if downloaded_items:
         status_text.success(f"✅ Successfully processed {len(downloaded_items)} items!")
