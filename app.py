@@ -43,9 +43,9 @@ class DownloadProgress:
         with self.lock:
             return self.progress_data.copy()
 
-# Global progress tracker
-if 'progress_tracker' not in st.session_state:
-    st.session_state.progress_tracker = DownloadProgress()
+# Global progress tracker (not in session state to avoid threading issues)
+if 'progress_tracker_instance' not in st.session_state:
+    st.session_state.progress_tracker_instance = None
 
 def create_progress_hook(video_id, progress_tracker):
     """Create a progress hook for a specific video"""
@@ -181,8 +181,8 @@ with col2:
     progress_placeholder = st.empty()
     
     # Auto-refresh progress during downloads
-    if st.session_state.is_downloading:
-        progress_data = st.session_state.progress_tracker.get_all_progress()
+    if st.session_state.is_downloading and st.session_state.progress_tracker_instance:
+        progress_data = st.session_state.progress_tracker_instance.get_all_progress()
         if progress_data:
             with progress_placeholder.container():
                 for video_id, data in progress_data.items():
@@ -224,7 +224,10 @@ if download_button:
         # Set downloading state
         st.session_state.is_downloading = True
         st.session_state.download_results = []
-        st.session_state.progress_tracker = DownloadProgress()
+        
+        # Create a new progress tracker instance
+        progress_tracker = DownloadProgress()
+        st.session_state.progress_tracker_instance = progress_tracker
         
         # Configure yt-dlp options
         base_options = {
@@ -266,7 +269,7 @@ if download_button:
                         url, 
                         base_options.copy(), 
                         i+1, 
-                        st.session_state.progress_tracker
+                        progress_tracker  # Pass the local instance, not session state
                     ): url for i, url in enumerate(urls)
                 }
                 
@@ -312,7 +315,7 @@ st.markdown("""
 - `https://m.youtube.com/watch?v=VIDEO_ID`
 """)
 
-
+# Requirements info
 st.markdown("**Note**: Make sure you have `ffmpeg` installed for audio extraction features.")
 
 # Footer
