@@ -1,3 +1,5 @@
 streamlit
 pytube
 yt-dlp
+ffmpeg-python
+pydub
