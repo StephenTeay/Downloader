@@ -1,132 +1,247 @@
 import streamlit as st
-from pytube import YouTube
-from io import BytesIO
-import re
+import yt_dlp
+import os
+import tempfile
+from pathlib import Path
+import threading
 import time
 
-# NEW: URL sanitization function
-def extract_video_id(url):
-    # Extract YouTube video ID from various URL formats
-    patterns = [
-        r"youtube\.com/watch\?v=([^&]+)",
-        r"youtu\.be/([^?]+)",
-        r"youtube\.com/embed/([^?]+)",
-        r"youtube\.com/v/([^?]+)"
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
+# Page configuration
+st.set_page_config(
+    page_title="YouTube Batch Downloader",
+    page_icon="📺",
+    layout="wide"
+)
+
+st.title("📺 YouTube Batch Downloader")
+st.markdown("Download multiple YouTube videos or extract audio with ease!")
+
+# Create download directory
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # Initialize session state
-if 'download_history' not in st.session_state:
-    st.session_state.download_history = []
+if 'download_progress' not in st.session_state:
+    st.session_state.download_progress = {}
+if 'download_status' not in st.session_state:
+    st.session_state.download_status = {}
 
-def download_media(url, media_type='video'):
-    """Download YouTube media and return as BytesIO object"""
+def progress_hook(d):
+    """Progress hook for yt-dlp"""
+    if d['status'] == 'downloading':
+        filename = d.get('filename', 'Unknown')
+        if '_percent_str' in d:
+            percent = d['_percent_str'].strip()
+            st.session_state.download_progress[filename] = percent
+        elif 'downloaded_bytes' in d and 'total_bytes' in d:
+            percent = (d['downloaded_bytes'] / d['total_bytes']) * 100
+            st.session_state.download_progress[filename] = f"{percent:.1f}%"
+    elif d['status'] == 'finished':
+        filename = d.get('filename', 'Unknown')
+        st.session_state.download_progress[filename] = "100%"
+        st.session_state.download_status[filename] = "✅ Complete"
+
+def download_single_video(url, options, index):
+    """Download a single video"""
     try:
-        # NEW: Use video ID to create clean URL
-        video_id = extract_video_id(url)
-        if not video_id:
-            raise ValueError("Invalid YouTube URL")
+        with yt_dlp.YoutubeDL(options) as ydl:
+            # Get video info first
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', f'Video_{index}')
+            st.session_state.download_status[title] = "⏳ Starting..."
             
-        # FIX: Construct a standard YouTube URL for pytube
-        clean_url = f"https://www.youtube.com/watch?v={video_id}" 
-        yt = YouTube(clean_url)
-        
-        if media_type == 'audio':
-            stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
-            filename = f"{yt.title}.mp3"
-        else:
-            stream = yt.streams.get_highest_resolution()
-            filename = f"{yt.title}.mp4"
-        
-        buffer = BytesIO()
-        stream.stream_to_buffer(buffer)
-        buffer.seek(0)
-        return buffer, filename, yt.title, clean_url, None
+            # Download the video
+            ydl.download([url])
+            st.session_state.download_status[title] = "✅ Complete"
+            
     except Exception as e:
-        return None, None, None, url, str(e)
+        error_msg = f"❌ Error: {str(e)}"
+        st.session_state.download_status[f"Video_{index}"] = error_msg
 
-def sanitize_filename(filename):
-    return "".join(c for c in filename if c.isalnum() or c in " -_.")
+def validate_youtube_url(url):
+    """Validate if URL is a valid YouTube URL"""
+    youtube_domains = ['youtube.com', 'youtu.be', 'www.youtube.com', 'm.youtube.com']
+    return any(domain in url.lower() for domain in youtube_domains)
 
-# Streamlit UI
-st.title("🎬 YouTube Batch Downloader")
-st.write("Download multiple YouTube videos or extract audio as MP3")
+# Sidebar for options
+st.sidebar.header("⚙️ Download Options")
 
-# Input section
-with st.expander("📥 Input URLs", expanded=True):
-    urls = st.text_area(
-        "Enter YouTube URLs (one per line):", 
-        height=150,
-        placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ\nhttps://youtu.be/another_video_id" # Updated placeholder
+# Download type selection
+download_type = st.sidebar.radio(
+    "Download Type:",
+    ["Video", "Audio Only"],
+    help="Choose whether to download video or extract audio only"
+)
+
+# Quality selection for video
+if download_type == "Video":
+    quality = st.sidebar.selectbox(
+        "Video Quality:",
+        ["best", "worst", "720p", "480p", "360p", "240p"],
+        help="Select video quality preference"
     )
     
-    col1, col2 = st.columns(2)
-    with col1:
-        media_type = st.radio("Download Type:", ['Video', 'Audio'])
-    with col2:
-        batch_size = st.slider("Batch Size:", 1, 10, 3)
+    format_selection = st.sidebar.selectbox(
+        "Video Format:",
+        ["mp4", "webm", "mkv", "any"],
+        help="Preferred video format"
+    )
+else:
+    audio_quality = st.sidebar.selectbox(
+        "Audio Quality:",
+        ["best", "320", "256", "192", "128"],
+        help="Audio quality in kbps (best = highest available)"
+    )
+    
+    audio_format = st.sidebar.selectbox(
+        "Audio Format:",
+        ["mp3", "m4a", "wav", "flac"],
+        help="Audio format for extraction"
+    )
 
-# Process URLs
-if st.button("🚀 Download Media", use_container_width=True):
-    if not urls.strip():
-        st.warning("⚠️ Please enter at least one URL")
-        st.stop()
+# Main interface
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.subheader("📝 YouTube URLs")
+    urls_input = st.text_area(
+        "Enter YouTube URLs (one per line):",
+        height=200,
+        placeholder="https://www.youtube.com/watch?v=example1\nhttps://www.youtube.com/watch?v=example2\nhttps://youtu.be/example3",
+        help="Paste YouTube URLs here, each on a new line"
+    )
     
-    url_list = [url.strip() for url in urls.split('\n') if url.strip()]
-    total_urls = len(url_list)
-    media_type = media_type.lower()
+    # Process URLs
+    urls = []
+    if urls_input:
+        raw_urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
+        valid_urls = []
+        invalid_urls = []
+        
+        for url in raw_urls:
+            if validate_youtube_url(url):
+                valid_urls.append(url)
+            else:
+                invalid_urls.append(url)
+        
+        urls = valid_urls
+        
+        if invalid_urls:
+            st.warning(f"⚠️ Invalid URLs detected: {len(invalid_urls)}")
+            with st.expander("Show invalid URLs"):
+                for invalid_url in invalid_urls:
+                    st.text(f"❌ {invalid_url}")
+        
+        if valid_urls:
+            st.success(f"✅ Valid URLs found: {len(valid_urls)}")
+
+with col2:
+    st.subheader("📊 Download Status")
     
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    downloaded_items = []
-    
-    for i, url in enumerate(url_list[:batch_size]):
-        try:
-            progress = int((i + 1) / min(batch_size, total_urls) * 100)
-            progress_bar.progress(min(progress, 100))
-            status_text.text(f"📥 Processing item {i+1}/{min(batch_size, total_urls)}...")
-            
-            buffer, filename, title, clean_url, error = download_media(url, media_type)
-            if error:
-                raise Exception(error)
-            
-            clean_filename = sanitize_filename(filename)
-            
-            st.download_button(
-                label=f"💾 Download: {title[:30]}..." if len(title) > 30 else f"💾 Download: {title}",
-                data=buffer,
-                file_name=clean_filename,
-                mime='audio/mp3' if media_type == 'audio' else 'video/mp4',
-                key=f"dl_{i}_{time.time()}"
-            )
-            
-            st.session_state.download_history.insert(0, {
-                'title': title,
-                'original_url': url,
-                'clean_url': clean_url,
-                'type': media_type,
-                'time': time.strftime("%Y-%m-%d %H:%M:%S")
+    if st.session_state.download_status:
+        for filename, status in st.session_state.download_status.items():
+            st.text(f"{filename[:30]}...")
+            st.text(status)
+            if filename in st.session_state.download_progress:
+                st.text(f"Progress: {st.session_state.download_progress[filename]}")
+            st.divider()
+    else:
+        st.info("No downloads in progress")
+
+# Download button and logic
+st.subheader("🚀 Start Download")
+
+if st.button("Start Batch Download", type="primary", disabled=not urls):
+    if not urls:
+        st.error("Please enter at least one valid YouTube URL")
+    else:
+        # Clear previous status
+        st.session_state.download_progress = {}
+        st.session_state.download_status = {}
+        
+        # Configure yt-dlp options
+        base_options = {
+            'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'),
+            'progress_hooks': [progress_hook],
+            'no_warnings': False,
+        }
+        
+        if download_type == "Audio Only":
+            base_options.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': audio_format,
+                    'preferredquality': audio_quality if audio_quality != 'best' else '0',
+                }],
             })
-            downloaded_items.append(title)
+        else:
+            if quality == "best":
+                format_string = 'best'
+            elif quality == "worst":
+                format_string = 'worst'
+            else:
+                format_string = f'best[height<={quality[:-1]}]'
             
-        except Exception as e:
-            st.error(f"❌ Failed to download '{url}': {str(e)}") # Added original URL to error message
-    
-    if downloaded_items:
-        status_text.success(f"✅ Successfully processed {len(downloaded_items)} items!")
-        progress_bar.empty()
+            if format_selection != "any":
+                format_string += f'[ext={format_selection}]'
+            
+            base_options['format'] = format_string
+        
+        # Start downloads
+        progress_placeholder = st.empty()
+        
+        with st.spinner("Downloading videos..."):
+            threads = []
+            for i, url in enumerate(urls):
+                thread = threading.Thread(
+                    target=download_single_video,
+                    args=(url, base_options.copy(), i+1)
+                )
+                threads.append(thread)
+                thread.start()
+            
+            # Monitor progress
+            while any(thread.is_alive() for thread in threads):
+                time.sleep(1)
+                # Force refresh of the status display
+                st.rerun()
+            
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join()
+        
+        st.success("🎉 Batch download completed!")
+        
+        # Show download summary
+        completed = sum(1 for status in st.session_state.download_status.values() if "✅" in status)
+        failed = sum(1 for status in st.session_state.download_status.values() if "❌" in status)
+        
+        st.info(f"Summary: {completed} successful, {failed} failed out of {len(urls)} total")
 
-# Display download history
-if st.session_state.download_history:
-    with st.expander("📚 Download History"):
-        for i, item in enumerate(st.session_state.download_history[:5]):
-            st.caption(f"{i+1}. [{item['type'].upper()}] {item['time']}")
-            st.markdown(f"**{item['title']}**")
-            st.code(f"Original: {item['original_url']}\nCleaned: {item['clean_url']}")
+# Instructions
+st.subheader("📋 Instructions")
+st.markdown("""
+1. **Add URLs**: Paste YouTube URLs in the text area (one per line)
+2. **Configure Options**: Choose download type, quality, and format in the sidebar
+3. **Start Download**: Click the download button to begin batch processing
+4. **Monitor Progress**: Watch the download status in real-time
+5. **Find Files**: Downloaded files will be saved in the `downloads` folder
 
-# How to use section remains the same
+**Supported URL formats:**
+- `https://www.youtube.com/watch?v=VIDEO_ID`
+- `https://youtu.be/VIDEO_ID`
+- `https://m.youtube.com/watch?v=VIDEO_ID`
+""")
+
+# Requirements info
+st.subheader("🔧 Installation Requirements")
+st.code("""
+pip install streamlit yt-dlp
+""")
+
+st.markdown("**Note**: Make sure you have `ffmpeg` installed for audio extraction features.")
+
+# Footer
+st.markdown("---")
+st.markdown("Made with ❤️ using Streamlit and yt-dlp")
