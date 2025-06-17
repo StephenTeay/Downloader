@@ -6,6 +6,12 @@ from pathlib import Path
 import threading
 import time
 
+# Initialize session state FIRST
+if 'download_progress' not in st.session_state:
+    st.session_state.download_progress = {}
+if 'download_status' not in st.session_state:
+    st.session_state.download_status = {}
+
 # Page configuration
 st.set_page_config(
     page_title="YouTube Batch Downloader",
@@ -19,12 +25,6 @@ st.markdown("Download multiple YouTube videos or extract audio with ease!")
 # Create download directory
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-# Initialize session state
-if 'download_progress' not in st.session_state:
-    st.session_state.download_progress = {}
-if 'download_status' not in st.session_state:
-    st.session_state.download_status = {}
 
 def progress_hook(d):
     """Progress hook for yt-dlp"""
@@ -235,12 +235,7 @@ st.markdown("""
 """)
 
 # Requirements info
-st.subheader("🔧 Installation Requirements")
-st.code("""
-pip install streamlit yt-dlp
-""")
 
-st.markdown("**Note**: Make sure you have `ffmpeg` installed for audio extraction features.")
 
 # Footer
 st.markdown("---")
