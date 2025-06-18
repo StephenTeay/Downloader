@@ -106,11 +106,6 @@ def create_download_options(download_dir, quality, format_type, audio_only):
     ffmpeg_path = shutil.which('ffmpeg')
     if ffmpeg_path:
         opts['ffmpeg_location'] = ffmpeg_path
-    elif audio_only:
-        # Fallback: download best audio format without conversion
-        st.warning("FFmpeg not found. Downloading in original audio format.")
-        opts['format'] = 'bestaudio/best'
-        return opts
     
     if audio_only:
         if format_type == "mp3":
@@ -178,10 +173,6 @@ def main():
         
         # Audio only toggle
         audio_only = st.checkbox("Audio Only", value=False)
-        
-        # Add warning for cloud deployment
-        if audio_only:
-            st.warning("⚠️ Audio extraction requires FFmpeg. If deployed on Streamlit Cloud, ensure packages.txt includes 'ffmpeg'")
         
         # Format selection
         if audio_only:
