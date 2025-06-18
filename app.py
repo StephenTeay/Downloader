@@ -1,502 +1,363 @@
 import streamlit as st
 import yt_dlp
 import os
-from pathlib import Path
-import concurrent.futures
-import time
-import queue
 import threading
+import time
+from pathlib import Path
 import zipfile
+from datetime import datetime
 import tempfile
-import io
-import base64
-
-# Initialize session state FIRST
-if 'download_results' not in st.session_state:
-    st.session_state.download_results = []
-if 'is_downloading' not in st.session_state:
-    st.session_state.is_downloading = False
+import shutil
 
 # Page configuration
 st.set_page_config(
-    page_title="YouTube Batch Downloader",
+    page_title="YouTube Downloader",
     page_icon="📺",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("📺 YouTube Batch Downloader")
-st.markdown("Download multiple YouTube videos or extract audio with ease!")
+# Initialize session state
+if 'downloads' not in st.session_state:
+    st.session_state.downloads = []
+if 'download_status' not in st.session_state:
+    st.session_state.download_status = {}
+if 'download_progress' not in st.session_state:
+    st.session_state.download_progress = {}
+if 'completed_files' not in st.session_state:
+    st.session_state.completed_files = []
 
-# Create download directory in a temporary location
-DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "youtube_downloads"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-st.info(f"📁 Files are temporarily stored on server at: `{DOWNLOAD_DIR}` and will be available for download below.")
-
-class DownloadProgress:
-    def __init__(self):
-        self.progress_data = {}
-        self.lock = threading.Lock()
-    
-    def update_progress(self, video_id, status, progress=None):
-        with self.lock:
-            self.progress_data[video_id] = {
-                'status': status,
-                'progress': progress or "0%"
-            }
-    
-    def get_all_progress(self):
-        with self.lock:
-            return self.progress_data.copy()
-
-# Global progress tracker (not in session state to avoid threading issues)
-if 'progress_tracker_instance' not in st.session_state:
-    st.session_state.progress_tracker_instance = None
-
-def create_progress_hook(video_id, progress_tracker):
-    """Create a progress hook for a specific video"""
-    def progress_hook(d):
+class StreamlitProgressHook:
+    def __init__(self, video_id, status_placeholder, progress_bar):
+        self.video_id = video_id
+        self.status_placeholder = status_placeholder
+        self.progress_bar = progress_bar
+        
+    def __call__(self, d):
         if d['status'] == 'downloading':
-            if '_percent_str' in d:
-                percent = d['_percent_str'].strip()
-                progress_tracker.update_progress(video_id, "⏳ Downloading", percent)
-            elif 'downloaded_bytes' in d and 'total_bytes' in d:
+            if 'total_bytes' in d and d['total_bytes']:
                 percent = (d['downloaded_bytes'] / d['total_bytes']) * 100
-                progress_tracker.update_progress(video_id, "⏳ Downloading", f"{percent:.1f}%")
+                self.progress_bar.progress(percent / 100)
+                speed = d.get('_speed_str', 'N/A')
+                self.status_placeholder.info(f"Downloading... {percent:.1f}% ({speed})")
+                st.session_state.download_progress[self.video_id] = percent
+            elif '_percent_str' in d:
+                # Fallback for when total_bytes is not available
+                percent_str = d['_percent_str'].strip('%')
+                try:
+                    percent = float(percent_str)
+                    self.progress_bar.progress(percent / 100)
+                    speed = d.get('_speed_str', 'N/A')
+                    self.status_placeholder.info(f"Downloading... {percent:.1f}% ({speed})")
+                    st.session_state.download_progress[self.video_id] = percent
+                except ValueError:
+                    pass
         elif d['status'] == 'finished':
-            progress_tracker.update_progress(video_id, "✅ Complete", "100%")
-    return progress_hook
+            self.progress_bar.progress(1.0)
+            filename = os.path.basename(d['filename'])
+            self.status_placeholder.success(f"✅ Download completed: {filename}")
+            st.session_state.download_status[self.video_id] = 'completed'
+            st.session_state.completed_files.append(d['filename'])
+        elif d['status'] == 'error':
+            self.status_placeholder.error(f"❌ Error: {d.get('error', 'Unknown error')}")
+            st.session_state.download_status[self.video_id] = 'error'
 
-def download_single_video(url, options, video_id, progress_tracker):
-    """Download a single video"""
-    file_path = None
-    title = f'Video_{video_id}'
+def get_video_info(url):
+    """Get video information without downloading"""
     try:
-        progress_tracker.update_progress(video_id, "🔄 Starting", "0%")
-        
-        # Create options with progress hook
-        download_options = options.copy()
-        download_options['progress_hooks'] = [create_progress_hook(video_id, progress_tracker)]
-        
-        with yt_dlp.YoutubeDL(download_options) as ydl:
-            # Get video info first
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
-            title = info.get('title', f'Video_{video_id}')
-            
-            progress_tracker.update_progress(video_id, f"⏳ Downloading: {title[:30]}...", "0%")
-            
-            # Download the video
+            return {
+                'title': info.get('title', 'Unknown'),
+                'duration': info.get('duration', 0),
+                'uploader': info.get('uploader', 'Unknown'),
+                'view_count': info.get('view_count', 0),
+                'thumbnail': info.get('thumbnail', ''),
+                'description': info.get('description', '')[:200] + '...' if info.get('description') else ''
+            }
+    except Exception as e:
+        return {'error': str(e)}
+
+def download_video(url, options, video_id, status_placeholder, progress_bar):
+    """Download a single video"""
+    try:
+        st.session_state.download_status[video_id] = 'downloading'
+        
+        # Create progress hook
+        progress_hook = StreamlitProgressHook(video_id, status_placeholder, progress_bar)
+        options['progress_hooks'] = [progress_hook]
+        
+        with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
             
-            # Verify file was actually downloaded
-            # yt-dlp might change the filename after post-processing (e.g., .mp4 to .mp3)
-            # We need to find the actual file that was created.
-            
-            # Get expected output filename before post-processing
-            expected_filename_base = ydl.prepare_filename(info)
-            
-            # Look for the file in the download directory, especially considering post-processing
-            found_files = []
-            for f in DOWNLOAD_DIR.iterdir():
-                # Check if the filename starts with the expected base name
-                # and if it has a common media extension
-                if f.stem.startswith(Path(expected_filename_base).stem) and \
-                   f.suffix.lower() in ['.mp4', '.mp3', '.m4a', '.webm', '.mkv', '.wav', '.flac']:
-                    found_files.append(f)
-            
-            if found_files:
-                # Assuming the most recently modified file among candidates is the one
-                found_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-                file_path = str(found_files[0])
-                file_size = os.path.getsize(file_path)
-                file_size_mb = file_size / (1024 * 1024)
-                success_msg = f'✅ Downloaded successfully ({file_size_mb:.1f} MB)'
-            else:
-                success_msg = '⚠️ Download completed but file not found on disk'
-
-        st.write(f"DEBUG: Download result for {title}: file_path={file_path}, message={success_msg}")
-        
-        return {
-            'url': url,
-            'title': title,
-            'status': 'success' if file_path else 'warning', # Mark as warning if file not found after 'success'
-            'message': success_msg,
-            'file_path': file_path
-        }
-            
     except Exception as e:
-        error_msg = f"❌ Error: {str(e)}"
-        progress_tracker.update_progress(video_id, error_msg, "Failed")
-        st.error(f"DEBUG: Error downloading {url}: {e}")
-        return {
-            'url': url,
-            'title': title,
-            'status': 'error',
-            'message': error_msg,
-            'file_path': None
-        }
+        status_placeholder.error(f"❌ Error: {str(e)}")
+        st.session_state.download_status[video_id] = 'error'
 
-def create_download_button(file_path, file_name):
-    """Create a download button for a file"""
-    st.write(f"DEBUG: Attempting to create button for: {file_path}, exists: {os.path.exists(file_path)}")
-    if os.path.exists(file_path):
-        with open(file_path, 'rb') as f:
-            file_data = f.read()
-        
-        st.download_button(
-            label=f"⬇️ Download {file_name}",
-            data=file_data,
-            file_name=file_name,
-            mime="application/octet-stream"
-        )
-        return True
-    return False
+def create_download_options(download_dir, quality, format_type, audio_only):
+    """Create yt-dlp options based on user selection"""
+    opts = {
+        'outtmpl': os.path.join(download_dir, '%(title)s.%(ext)s'),
+        'noplaylist': True,
+    }
+    
+    # Handle FFmpeg path for Streamlit Cloud
+    import shutil
+    ffmpeg_path = shutil.which('ffmpeg')
+    if ffmpeg_path:
+        opts['ffmpeg_location'] = ffmpeg_path
+    elif audio_only:
+        # Fallback: download best audio format without conversion
+        st.warning("FFmpeg not found. Downloading in original audio format.")
+        opts['format'] = 'bestaudio/best'
+        return opts
+    
+    if audio_only:
+        if format_type == "mp3":
+            opts['format'] = 'bestaudio/best'
+            opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        elif format_type == "m4a":
+            opts['format'] = 'bestaudio/best'
+            opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'm4a',
+            }]
+        elif format_type == "wav":
+            opts['format'] = 'bestaudio/best'
+            opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'wav',
+            }]
+    else:
+        if quality == "Best":
+            opts['format'] = 'best'
+        elif quality == "Worst":
+            opts['format'] = 'worst'
+        else:
+            height = quality.replace('p', '')
+            opts['format'] = f'best[height<={height}]'
+    
+    return opts
 
-def create_zip_download(files_list):
-    """Create a zip file containing all downloaded files"""
-    if not files_list:
+def create_zip_download(files):
+    """Create a ZIP file containing all downloaded files"""
+    if not files:
         return None
     
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for file_path in files_list:
+    # Create temporary zip file
+    temp_dir = tempfile.mkdtemp()
+    zip_path = os.path.join(temp_dir, f"youtube_downloads_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+    
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for file_path in files:
             if os.path.exists(file_path):
-                file_name = os.path.basename(file_path)
-                zip_file.write(file_path, file_name)
+                # Add file to zip with just the filename (not full path)
+                zipf.write(file_path, os.path.basename(file_path))
     
-    zip_buffer.seek(0)
-    return zip_buffer.getvalue()
+    return zip_path
 
-def validate_youtube_url(url):
-    """Validate if URL is a valid YouTube URL (improved check)"""
-    youtube_patterns = [
-        'youtube.com/watch?v=',
-        'youtu.be/',
-        'youtube.com/playlist?list=',
-        'youtube.com/shorts/'
-    ]
-    return any(pattern in url for pattern in youtube_patterns)
-
-# Sidebar for options
-st.sidebar.header("⚙️ Download Options")
-
-# Download type selection
-download_type = st.sidebar.radio(
-    "Download Type:",
-    ["Video", "Audio Only"],
-    help="Choose whether to download video or extract audio only"
-)
-
-# Quality selection for video
-if download_type == "Video":
-    quality = st.sidebar.selectbox(
-        "Video Quality:",
-        ["best", "worst", "720p", "480p", "360p", "240p"],
-        help="Select video quality preference"
-    )
+# Main app
+def main():
+    st.title("📺 Multi-threaded YouTube Downloader")
+    st.markdown("Download multiple YouTube videos simultaneously with audio extraction support")
     
-    format_selection = st.sidebar.selectbox(
-        "Video Format:",
-        ["mp4", "webm", "mkv", "any"],
-        help="Preferred video format"
-    )
-else:
-    audio_quality = st.sidebar.selectbox(
-        "Audio Quality:",
-        ["best", "320", "256", "192", "128"],
-        help="Audio quality in kbps (best = highest available)"
-    )
-    
-    audio_format = st.sidebar.selectbox(
-        "Audio Format:",
-        ["mp3", "m4a", "wav", "flac"],
-        help="Audio format for extraction"
-    )
-
-# Main interface
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    st.subheader("📝 YouTube URLs")
-    urls_input = st.text_area(
-        "Enter YouTube URLs (one per line):",
-        height=200,
-        placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ\nhttps://youtu.be/another_video_id",
-        help="Paste YouTube URLs here, each on a new line"
-    )
-    
-    # Process URLs
-    urls = []
-    if urls_input:
-        raw_urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
-        valid_urls = []
-        invalid_urls = []
+    # Sidebar for settings
+    with st.sidebar:
+        st.header("⚙️ Download Settings")
         
-        for url in raw_urls:
-            if validate_youtube_url(url):
-                valid_urls.append(url)
-            else:
-                invalid_urls.append(url)
+        # Quality selection
+        quality = st.selectbox(
+            "Video Quality",
+            ["Best", "720p", "480p", "360p", "240p", "Worst"],
+            index=0
+        )
         
-        urls = valid_urls
+        # Audio only toggle
+        audio_only = st.checkbox("Audio Only", value=False)
         
-        if invalid_urls:
-            st.warning(f"⚠️ Invalid URLs detected: {len(invalid_urls)}")
-            with st.expander("Show invalid URLs"):
-                for invalid_url in invalid_urls:
-                    st.text(f"❌ {invalid_url}")
+        # Add warning for cloud deployment
+        if audio_only:
+            st.warning("⚠️ Audio extraction requires FFmpeg. If deployed on Streamlit Cloud, ensure packages.txt includes 'ffmpeg'")
         
-        if valid_urls:
-            st.success(f"✅ Valid URLs found: {len(valid_urls)}")
-
-with col2:
-    st.subheader("📊 Download Status")
-    
-    # Show real-time progress
-    progress_placeholder = st.empty()
-    
-    # Auto-refresh progress during downloads
-    if st.session_state.is_downloading: # Removed the unnecessary check for progress_tracker_instance here
-        if st.session_state.progress_tracker_instance:
-            progress_data = st.session_state.progress_tracker_instance.get_all_progress()
-            if progress_data:
-                with progress_placeholder.container():
-                    for video_id, data in progress_data.items():
-                        st.text(f"Video {video_id}: {data['status']}")
-                        if data['progress'] != "Failed":
-                            st.text(f"Progress: {data['progress']}")
-                        st.divider()
-            else:
-                progress_placeholder.info("No downloads in progress (Progress data not yet available).")
+        # Format selection
+        if audio_only:
+            format_type = st.selectbox(
+                "Audio Format",
+                ["mp3", "m4a", "wav"],
+                index=0
+            )
         else:
-             progress_placeholder.info("Initializing download tracker...")
+            format_type = st.selectbox(
+                "Video Format",
+                ["mp4", "webm"],
+                index=0
+            )
         
-        # Auto-refresh every 0.5 seconds during download
-        time.sleep(0.5)
-        st.rerun() # This will cause the page to re-run and update progress
-    else:
-        # Show results from last download batch
-        if st.session_state.download_results:
-            with progress_placeholder.container():
-                st.write("**Last Download Results:**")
-                for result in st.session_state.download_results:
-                    st.text(f"📹 {result['title'][:40]}...")
-                    st.text(result['message'])
-                    st.divider()
-        else:
-            progress_placeholder.info("No downloads completed yet")
-
-# Download button and logic
-st.subheader("🚀 Start Download")
-
-download_button = st.button(
-    "Start Batch Download", 
-    type="primary", 
-    disabled=not urls or st.session_state.is_downloading
-)
-
-if download_button:
-    if not urls:
-        st.error("Please enter at least one valid YouTube URL")
-    else:
-        # Set downloading state
-        st.session_state.is_downloading = True
-        st.session_state.download_results = []
+        # Max concurrent downloads
+        max_concurrent = st.slider(
+            "Max Concurrent Downloads",
+            min_value=1,
+            max_value=10,
+            value=3,
+            help="Number of videos to download simultaneously"
+        )
         
-        # Create a new progress tracker instance
-        progress_tracker = DownloadProgress()
-        st.session_state.progress_tracker_instance = progress_tracker
-        
-        # Configure yt-dlp options
-        base_options = {
-            'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'),
-            'no_warnings': True, # Suppress warnings for cleaner output
-            'extract_flat': False,
-            'writeinfojson': False,  # Don't write info json
-            'writethumbnail': False,  # Don't write thumbnail
-        }
-        
-        if download_type == "Audio Only":
-            base_options.update({
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': audio_format,
-                    'preferredquality': audio_quality if audio_quality != 'best' else '0',
-                }],
-            })
-        else:
-            if quality == "best":
-                format_string = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' # Prefer mp4 if possible
-            elif quality == "worst":
-                format_string = 'worst'
-            else:
-                format_string = f'bestvideo[height<={quality[:-1]}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality[:-1]}]'
-            
-            if format_selection != "any":
-                # Ensure the format_string handles cases like 'mp4'
-                if format_selection == 'mp4':
-                     format_string = f'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]'
-                else:
-                    format_string = f'{format_string}[ext={format_selection}]'
-            
-            base_options['format'] = format_string
-            base_options['merge_output_format'] = format_selection if format_selection != "any" else "mp4" # Ensure merged output is preferred format
-
-        st.write(f"DEBUG: yt-dlp options: {base_options}")
-        
-        # Start downloads using ThreadPoolExecutor
-        def run_downloads():
-            results = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                # Submit all download tasks
-                future_to_url = {
-                    executor.submit(
-                        download_single_video, 
-                        url, 
-                        base_options.copy(), 
-                        i+1, 
-                        progress_tracker  # Pass the local instance
-                    ): url for i, url in enumerate(urls)
-                }
-                
-                # Collect results as they complete
-                for future in concurrent.futures.as_completed(future_to_url):
-                    result = future.result()
-                    results.append(result)
-            
-            # Update session state with results
-            st.session_state.download_results = results
-            st.session_state.is_downloading = False
-            # Trigger a rerun after downloads complete to show final results and buttons
-            st.rerun() 
-        
-        # Run downloads in a separate thread to avoid blocking UI
-        download_thread = threading.Thread(target=run_downloads)
-        download_thread.start()
-        
-        st.info("🔄 Starting batch download... Progress will appear on the right.")
-        st.rerun()
-
-# Show download summary when downloads are complete
-if st.session_state.download_results and not st.session_state.is_downloading:
-    results = st.session_state.download_results
-    completed = sum(1 for r in results if r['status'] == 'success')
-    failed = sum(1 for r in results if r['status'] == 'error')
+        st.markdown("---")
+        st.markdown("### 📁 Download Location")
+        st.info("Files will be saved to a temporary directory and can be downloaded as a ZIP file.")
     
-    if completed > 0:
-        st.success(f"🎉 Batch download completed! {completed} successful, {failed} failed out of {len(results)} total")
+    # Main content area
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.header("🔗 YouTube URLs")
+        urls_input = st.text_area(
+            "Enter YouTube URLs (one per line)",
+            height=150,
+            placeholder="https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=...",
+            help="Paste YouTube video URLs, one per line"
+        )
         
-        # Show file listing with download buttons
-        if DOWNLOAD_DIR.exists():
-            files = list(DOWNLOAD_DIR.glob('*'))
-            video_files = [f for f in files if f.is_file() and f.suffix.lower() in ['.mp4', '.mp3', '.m4a', '.webm', '.mkv', '.wav', '.flac']]
-            st.write(f"DEBUG: Files found in DOWNLOAD_DIR after completion: {[f.name for f in files]}")
-            st.write(f"DEBUG: Filtered video_files after completion: {[f.name for f in video_files]}")
+        # Parse URLs
+        urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
+        
+        if urls:
+            st.success(f"Found {len(urls)} URL(s)")
             
-            if video_files:
-                st.subheader("📂 Your Downloaded Files (From Latest Batch)")
-                
-                # Create zip download for all files
-                if len(video_files) > 1:
-                    zip_data = create_zip_download([str(f) for f in video_files])
-                    if zip_data:
-                        st.download_button(
-                            label="📦 Download All Files as ZIP",
-                            data=zip_data,
-                            file_name="youtube_downloads.zip",
-                            mime="application/zip",
-                            key="batch_zip_download" # Unique key
-                        )
-                        st.divider()
-                
-                # Individual file downloads
-                for file in sorted(video_files, key=lambda x: x.stat().st_mtime, reverse=True):
-                    file_size = file.stat().st_size / (1024 * 1024)  # MB
-                    col1_d, col2_d = st.columns([3, 1])
-                    
-                    with col1_d:
-                        st.text(f"📄 {file.name} ({file_size:.1f} MB)")
-                    
-                    with col2_d:
-                        create_download_button(str(file), file.name)
-            else:
-                st.info("No new media files were found in the download directory from this batch.")
-    else:
-        st.error(f"❌ All downloads failed. {failed} out of {len(results)} total. Check the 'Last Download Results' above for details.")
-
-# Add file browser section with download buttons
-st.subheader("📂 All Available Downloads on Server")
-if DOWNLOAD_DIR.exists():
-    files = list(DOWNLOAD_DIR.glob('*'))
-    video_files = [f for f in files if f.is_file() and f.suffix.lower() in ['.mp4', '.mp3', '.m4a', '.webm', '.mkv', '.wav', '.flac']]
+            # Preview videos button
+            if st.button("🔍 Preview Videos", type="secondary"):
+                with st.expander("Video Previews", expanded=True):
+                    for i, url in enumerate(urls):
+                        with st.spinner(f"Loading info for video {i+1}..."):
+                            info = get_video_info(url)
+                            
+                            if 'error' in info:
+                                st.error(f"❌ Error loading video {i+1}: {info['error']}")
+                            else:
+                                col_thumb, col_info = st.columns([1, 3])
+                                
+                                with col_thumb:
+                                    if info['thumbnail']:
+                                        st.image(info['thumbnail'], width=120)
+                                
+                                with col_info:
+                                    st.write(f"**{info['title']}**")
+                                    st.write(f"👤 {info['uploader']}")
+                                    if info['duration']:
+                                        minutes = info['duration'] // 60
+                                        seconds = info['duration'] % 60
+                                        st.write(f"⏱️ {minutes}:{seconds:02d}")
+                                    if info['view_count']:
+                                        st.write(f"👀 {info['view_count']:,} views")
+                                
+                                st.markdown("---")
     
-    st.write(f"DEBUG: All files found in DOWNLOAD_DIR: {[f.name for f in files]}")
-    st.write(f"DEBUG: All filtered video_files: {[f.name for f in video_files]}")
-    
-    if video_files:
-        st.write(f"**Files ready for download:** ({len(video_files)} files)")
+    with col2:
+        st.header("📊 Download Status")
         
-        # Bulk download option
-        if len(video_files) > 1:
-            zip_data = create_zip_download([str(f) for f in video_files])
-            if zip_data:
-                st.download_button(
-                    label="📦 Download All Files as ZIP",
-                    data=zip_data,
-                    file_name="youtube_downloads.zip",
-                    mime="application/zip",
-                    key="bulk_download_all" # Unique key
+        if urls and st.button("🚀 Start Downloads", type="primary", use_container_width=True):
+            # Create temporary download directory
+            download_dir = tempfile.mkdtemp()
+            
+            # Clear previous state
+            st.session_state.downloads = []
+            st.session_state.download_status = {}
+            st.session_state.download_progress = {}
+            st.session_state.completed_files = []
+            
+            # Create download options
+            options = create_download_options(download_dir, quality, format_type, audio_only)
+            
+            st.success("Downloads started!")
+            
+            # Create download containers
+            download_containers = []
+            for i, url in enumerate(urls):
+                video_id = f"video_{i}"
+                container = st.container()
+                with container:
+                    st.write(f"**Video {i+1}**: {url[:50]}...")
+                    progress_bar = st.progress(0)
+                    status_placeholder = st.empty()
+                    status_placeholder.info("⏳ Queued...")
+                
+                download_containers.append((video_id, url, status_placeholder, progress_bar))
+            
+            # Start downloads with threading
+            def start_download_thread(video_id, url, status_placeholder, progress_bar):
+                download_video(url, options.copy(), video_id, status_placeholder, progress_bar)
+            
+            # Limit concurrent downloads
+            active_threads = []
+            for video_id, url, status_placeholder, progress_bar in download_containers:
+                # Wait if we have too many active downloads
+                while len([t for t in active_threads if t.is_alive()]) >= max_concurrent:
+                    time.sleep(0.1)
+                
+                # Start new download thread
+                thread = threading.Thread(
+                    target=start_download_thread,
+                    args=(video_id, url, status_placeholder, progress_bar),
+                    daemon=True
                 )
-                st.divider()
-        
-        # Individual downloads
-        for file in sorted(video_files, key=lambda x: x.stat().st_mtime, reverse=True):
-            file_size = file.stat().st_size / (1024 * 1024)  # MB
-            modified_time = time.ctime(file.stat().st_mtime)
+                thread.start()
+                active_threads.append(thread)
+                time.sleep(0.5)  # Small delay between starts
             
-            col1_f, col2_f = st.columns([3, 1])
-            with col1_f:
-                st.text(f"📄 {file.name}")
-                st.caption(f"Size: {file_size:.1f} MB | Modified: {modified_time}")
+            # Show overall progress
+            st.markdown("---")
+            overall_progress = st.progress(0)
+            overall_status = st.empty()
             
-            with col2_f:
-                create_download_button(str(file), file.name)
-    else:
-        st.info("No video/audio files available for download yet in the temporary directory.")
+            # Monitor progress
+            while True:
+                completed = len([s for s in st.session_state.download_status.values() if s in ['completed', 'error']])
+                total = len(urls)
+                
+                if completed > 0:
+                    progress = completed / total
+                    overall_progress.progress(progress)
+                    overall_status.info(f"Overall Progress: {completed}/{total} completed")
+                
+                if completed == total:
+                    break
+                
+                time.sleep(1)
+            
+            # Create download ZIP when all complete
+            if st.session_state.completed_files:
+                zip_path = create_zip_download(st.session_state.completed_files)
+                if zip_path:
+                    with open(zip_path, "rb") as fp:
+                        st.download_button(
+                            label="📦 Download All Files (ZIP)",
+                            data=fp.read(),
+                            file_name=os.path.basename(zip_path),
+                            mime="application/zip",
+                            type="primary",
+                            use_container_width=True
+                        )
+                    st.success("✅ All downloads completed! Click the button above to download your files.")
         
-        # Clean up any non-media files
-        other_files = [f for f in files if f.is_file() and f.suffix.lower() not in ['.mp4', '.mp3', '.m4a', '.webm', '.mkv', '.wav', '.flac']]
-        if other_files:
-            st.caption(f"Note: Found {len(other_files)} other files (e.g., info/thumbnails) - only media files are shown. You can manually delete these from the server if needed.")
-else:
-    st.error("Download folder not accessible or does not exist!")
+        # Clear button
+        if st.button("🗑️ Clear URLs", use_container_width=True):
+            st.rerun()
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style='text-align: center; color: #666;'>
+            <p>Built with Streamlit • Powered by yt-dlp</p>
+            <p><small>⚠️ Please respect copyright laws and YouTube's Terms of Service</small></p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-# Instructions
-st.subheader("📋 Instructions")
-st.markdown("""
-1.  **Add URLs**: Paste YouTube URLs in the text area (one per line).
-2.  **Configure Options**: Choose download type, quality, and format in the sidebar.
-3.  **Start Download**: Click the download button to begin batch processing.
-4.  **Monitor Progress**: Watch the download status in real-time on the right.
-5.  **Download Files**: Use the download buttons below to save files to your device.
-6.  **Bulk Download**: Use "Download All as ZIP" for multiple files at once.
-
-**Supported URL formats:**
--   `https://www.youtube.com/watch?v=VIDEO_ID`
--   `https://youtu.be/VIDEO_ID`
--   `https://www.youtube.com/playlist?list=PLAYLIST_ID` (downloads videos from playlist)
--   `https://www.youtube.com/shorts/SHORT_ID`
-""")
-
-# Requirements info
-st.subheader("🔧 Installation Requirements")
-st.code("""
-pip install streamlit yt-dlp
-""")
-
-st.markdown("**Note**: Make sure you have `ffmpeg` installed on the system running this Streamlit app for audio extraction and format conversion features. Streamlit Cloud usually has `ffmpeg` pre-installed.")
-
-# Footer
-st.markdown("---")
-st.markdown("Made with ❤️ using Streamlit and yt-dlp")
+if __name__ == "__main__":
+    main()
